@@ -71,8 +71,8 @@ c1=CHAR[1], c2=CHAR[2], c3=CHAR[3], c4=CHAR[4],
 c5=CHAR[5], c6=CHAR[6], c7=CHAR[7], c8=CHAR[8],
 )
 def _short_prompt(prompt: str) -> str:
-"""Keep under 280 chars for Pollinations free tier"""
-return prompt[:280] if len(prompt) > 280 else prompt
+"""Keep under 200 chars for Pollinations free tier"""
+return prompt[:200] if len(prompt) > 200 else prompt
 # ═════════════════════════════════════════════════════════════════════════════
 # STEP 1: SCRIPT — Gemini Flash → Groq → Cerebras
 # ═════════════════════════════════════════════════════════════════════════════
