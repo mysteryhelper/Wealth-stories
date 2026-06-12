@@ -2,10 +2,11 @@
 Wealth Stories — YouTube Automation Pipeline
 Channel: @WealthStoriesWS
 Stack: google-genai (new SDK) + Groq + Cerebras fallback
-       Pollinations images (short prompts) + Edge TTS + FFmpeg
+       HuggingFace SDXL images + placeholder fallback
+       Edge TTS + FFmpeg
 """
 
-import os, json, time, requests, subprocess, urllib.parse
+import os, json, time, requests, subprocess
 from pathlib import Path
 
 OUTPUT_DIR = Path("output")
@@ -15,6 +16,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+HF_API_KEY       = os.environ.get("HF_API_KEY", "")   # HuggingFace
 
 # ─── CHARACTER BIBLE (consistent across all scenes) ───────────────────────────
 CHAR = {
@@ -77,10 +79,6 @@ def _get_prompt(topic: str) -> str:
         c1=CHAR[1], c2=CHAR[2], c3=CHAR[3], c4=CHAR[4],
         c5=CHAR[5], c6=CHAR[6], c7=CHAR[7], c8=CHAR[8],
     )
-
-def _short_prompt(prompt: str) -> str:
-    """Keep under 200 chars for Pollinations free tier"""
-    return prompt[:200] if len(prompt) > 200 else prompt
 
 # ═════════════════════════════════════════════════════════════════════════════
 # STEP 1: SCRIPT — Gemini Flash → Groq → Cerebras
@@ -162,61 +160,33 @@ def generate_script(topic: str) -> dict:
     raise RuntimeError(f"All script providers failed. Last: {last_err}")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 2: IMAGES
-# Fallback chain:
-#   1. ZhipuAI CogView-3-Flash (free, Chinese, good quality)
-#   2. HuggingFace Stable Diffusion (free 30k/month)
-#   3. Pollinations (free, no key, backup)
-#   4. Placeholder (solid color, last resort)
+# STEP 2: IMAGES — HuggingFace SDXL → Solid Color Placeholder
+# No Pollinations.
 # ═════════════════════════════════════════════════════════════════════════════
 
-ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
-HF_API_KEY    = os.environ.get("HF_API_KEY", "")
-
 def _save_image(content: bytes, scene_no: int) -> str:
+    if content.startswith(b'<') or content.startswith(b'{'):
+        raise ValueError(f"API returned text instead of image: {content[:200]}")
     if len(content) < 3000:
         raise ValueError(f"Image too small: {len(content)} bytes")
     path = OUTPUT_DIR / f"scene_{scene_no:02d}.jpg"
     path.write_bytes(content)
     return str(path)
 
-def _zhipu_image(prompt: str, scene_no: int) -> str:
-    """ZhipuAI CogView-3-Flash — free tier, good quality"""
-    if not ZHIPU_API_KEY:
-        raise ValueError("No ZHIPU_API_KEY")
-    r = requests.post(
-        "https://open.bigmodel.cn/api/paas/v4/images/generations",
-        headers={
-            "Authorization": f"Bearer {ZHIPU_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "cogview-3-flash",
-            "prompt": prompt[:500],
-            "size": "1280x720",
-            "n": 1
-        },
-        timeout=60
-    )
-    r.raise_for_status()
-    img_url = r.json()["data"][0]["url"]
-    img_r = requests.get(img_url, timeout=60)
-    img_r.raise_for_status()
-    return _save_image(img_r.content, scene_no)
-
 def _hf_image(prompt: str, scene_no: int) -> str:
-    """HuggingFace SDXL — 30k free requests/month"""
+    """HuggingFace SDXL — free tier 30k requests/month"""
     if not HF_API_KEY:
-        raise ValueError("No HF_API_KEY")
+        raise ValueError("HF_API_KEY missing")
+    # Shorten prompt to avoid token limit issues
+    short_prompt = prompt[:400]
     r = requests.post(
         "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
         headers={"Authorization": f"Bearer {HF_API_KEY}"},
-        json={"inputs": prompt[:400]},
+        json={"inputs": short_prompt},
         timeout=90
     )
     r.raise_for_status()
     return _save_image(r.content, scene_no)
-
 
 def _placeholder(scene_no: int) -> str:
     """Last resort — solid color block"""
@@ -233,28 +203,29 @@ def _placeholder(scene_no: int) -> str:
 
 def generate_images(script: dict) -> list:
     image_paths = []
-    providers = [
-        ("ZhipuAI CogView-3-Flash", _zhipu_image),
-        ("HuggingFace SDXL",        _hf_image),
-    ]
     for scene in script["scenes"]:
         n      = scene["scene_no"]
         prompt = scene["image_prompt"]
         print(f"\n🎨 Image Scene {n}/8...")
         path = None
-        for label, fn in providers:
+
+        # Try HuggingFace only
+        if HF_API_KEY:
             try:
-                path = fn(prompt, n)
-                print(f"   ✅ {label}")
-                break
+                path = _hf_image(prompt, n)
+                print(f"   ✅ HuggingFace SDXL")
             except Exception as e:
-                print(f"   ❌ {label}: {e}")
-                time.sleep(3)
+                print(f"   ❌ HuggingFace failed: {e}")
+        else:
+            print("   ⚠️  HF_API_KEY not set, skipping HuggingFace")
+
+        # Fallback to placeholder
         if not path:
             path = _placeholder(n)
-            print(f"   ⚠️  Placeholder scene {n}")
+            print(f"   ⚠️  Placeholder used for scene {n}")
+
         image_paths.append(path)
-        time.sleep(2)
+        time.sleep(2)   # Respect rate limits
     return image_paths
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -410,6 +381,9 @@ def generate_metadata(script: dict) -> dict:
         try:
             print(f"\n📋 Metadata → {name}...")
             result = fn()
+            # ensure title length
+            if "youtube_title" in result and len(result["youtube_title"]) > 70:
+                result["youtube_title"] = result["youtube_title"][:70]
             with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print("   ✅ Done")
@@ -418,8 +392,9 @@ def generate_metadata(script: dict) -> dict:
             print(f"   ❌ {name}: {e}")
 
     # Fallback metadata
+    fallback_title = f"⭐ {script['title']}"[:70]
     fallback = {
-        "youtube_title": f"⭐ {script['title']}",
+        "youtube_title": fallback_title,
         "description": script["narration_intro"],
         "tags": ["wealth stories", "rags to riches", "indian success story",
                  "motivational", "financial freedom"]
