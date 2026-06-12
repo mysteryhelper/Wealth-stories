@@ -1,13 +1,16 @@
-name: Wealth Stories — Video Pipeline
+name: Wealth Stories â€” Video Pipeline
 
 on:
+  # Manual trigger with custom topic
   workflow_dispatch:
     inputs:
       topic:
         description: 'Story topic (English)'
         required: true
-        default: 'A poor boy from a village who became a millionaire with just 100 rupees'
+        default: 'A poor boy from a village who became a millionaire with just â‚¹100'
         type: string
+
+  # Daily 7 AM IST = 1:30 AM UTC
   schedule:
     - cron: '30 1 * * *'
 
@@ -42,7 +45,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" == "schedule" ]; then
             TOPIC=$(python scripts/random_topic.py)
-            echo "Today's topic: $TOPIC"
+            echo "ðŸ“Œ Today's topic: $TOPIC"
           else
             TOPIC="${{ github.event.inputs.topic }}"
           fi
@@ -61,11 +64,14 @@ jobs:
 
       - name: Job Summary
         run: |
-          echo "## 💰 Wealth Stories — Video Ready!" >> $GITHUB_STEP_SUMMARY
+          echo "## ðŸ’° Wealth Stories â€” Video Ready!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f output/metadata.json ]; then
             TITLE=$(python -c "import json; print(json.load(open('output/metadata.json'))['youtube_title'])")
             PROVIDER=$(python -c "import json; print(json.load(open('output/script.json')).get('_provider','?'))")
             echo "**YouTube Title:** $TITLE" >> $GITHUB_STEP_SUMMARY
             echo "**Script Provider:** $PROVIDER" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files:" >> $GITHUB_STEP_SUMMARY
           ls -lh output/ >> $GITHUB_STEP_SUMMARY
