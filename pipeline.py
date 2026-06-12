@@ -162,47 +162,64 @@ def generate_script(topic: str) -> dict:
     raise RuntimeError(f"All script providers failed. Last: {last_err}")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 2: IMAGES — Gemini 2.5 Flash Image → Pollinations → Placeholder
-# Gemini: 500 free images/day, same API key!
+# STEP 2: IMAGES
+# Fallback chain:
+#   1. ZhipuAI CogView-3-Flash (free, Chinese, good quality)
+#   2. HuggingFace Stable Diffusion (free 30k/month)
+#   3. Pollinations (free, no key, backup)
+#   4. Placeholder (solid color, last resort)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _gemini_image(prompt: str, scene_no: int) -> str:
-    """Gemini 2.5 Flash Image — 500/day free, same GEMINI_API_KEY"""
-    if not GEMINI_API_KEY:
-        raise ValueError("No GEMINI_API_KEY")
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_images(
-        model="imagen-3.0-generate-002",
-        prompt=prompt,
-        config=types.GenerateImagesConfig(
-            number_of_images=1,
-            aspect_ratio="16:9",
-            safety_filter_level="block_some",
-            person_generation="allow_adult",
-        ),
-    )
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
+HF_API_KEY    = os.environ.get("HF_API_KEY", "")
+
+def _save_image(content: bytes, scene_no: int) -> str:
+    if len(content) < 3000:
+        raise ValueError(f"Image too small: {len(content)} bytes")
     path = OUTPUT_DIR / f"scene_{scene_no:02d}.jpg"
-    response.generated_images[0].image.save(str(path))
+    path.write_bytes(content)
     return str(path)
 
-def _pollinations_fallback(prompt: str, scene_no: int) -> str:
-    """Pollinations as fallback — short prompt"""
-    short = prompt[:200]
-    url = (
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(short)}"
-        f"?width=1280&height=720&nologo=true&seed={scene_no * 37}"
+def _zhipu_image(prompt: str, scene_no: int) -> str:
+    """ZhipuAI CogView-3-Flash — free tier, good quality"""
+    if not ZHIPU_API_KEY:
+        raise ValueError("No ZHIPU_API_KEY")
+    r = requests.post(
+        "https://open.bigmodel.cn/api/paas/v4/images/generations",
+        headers={
+            "Authorization": f"Bearer {ZHIPU_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "cogview-3-flash",
+            "prompt": prompt[:500],
+            "size": "1280x720",
+            "n": 1
+        },
+        timeout=60
     )
-    r = requests.get(url, timeout=90)
     r.raise_for_status()
-    if len(r.content) < 5000:
-        raise ValueError(f"Too small: {len(r.content)} bytes")
-    path = OUTPUT_DIR / f"scene_{scene_no:02d}.jpg"
-    path.write_bytes(r.content)
-    return str(path)
+    img_url = r.json()["data"][0]["url"]
+    img_r = requests.get(img_url, timeout=60)
+    img_r.raise_for_status()
+    return _save_image(img_r.content, scene_no)
+
+def _hf_image(prompt: str, scene_no: int) -> str:
+    """HuggingFace SDXL — 30k free requests/month"""
+    if not HF_API_KEY:
+        raise ValueError("No HF_API_KEY")
+    r = requests.post(
+        "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
+        headers={"Authorization": f"Bearer {HF_API_KEY}"},
+        json={"inputs": prompt[:400]},
+        timeout=90
+    )
+    r.raise_for_status()
+    return _save_image(r.content, scene_no)
+
 
 def _placeholder(scene_no: int) -> str:
+    """Last resort — solid color block"""
     colors = ["#1a1a2e","#16213e","#0f3460","#533483","#2b2d42","#8d99ae","#e94560","#ef233c"]
     color  = colors[scene_no % len(colors)]
     path   = OUTPUT_DIR / f"scene_{scene_no:02d}.jpg"
@@ -216,15 +233,15 @@ def _placeholder(scene_no: int) -> str:
 
 def generate_images(script: dict) -> list:
     image_paths = []
+    providers = [
+        ("ZhipuAI CogView-3-Flash", _zhipu_image),
+        ("HuggingFace SDXL",        _hf_image),
+    ]
     for scene in script["scenes"]:
         n      = scene["scene_no"]
         prompt = scene["image_prompt"]
         print(f"\n🎨 Image Scene {n}/8...")
         path = None
-        providers = [
-            ("Gemini Imagen 3",    lambda p, n: _gemini_image(p, n)),
-            ("Pollinations",       lambda p, n: _pollinations_fallback(p, n)),
-        ]
         for label, fn in providers:
             try:
                 path = fn(prompt, n)
@@ -439,3 +456,4 @@ if __name__ == "__main__":
     topic = sys.argv[1] if len(sys.argv) > 1 else \
         "A poor boy from a village who became a millionaire with just 100 rupees"
     run_pipeline(topic)
+
