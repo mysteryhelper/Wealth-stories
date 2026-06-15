@@ -1,7 +1,7 @@
 """
 Wealth Stories — YouTube Automation Pipeline
 Channel: @WealthStoriesWS
-Images: HuggingFace SDXL → Placeholder
+Images: HuggingFace SDXL
 Script: Gemini Flash → Groq → Cerebras
 Voice:  Edge TTS en-US-AriaNeural
 """
@@ -127,130 +127,185 @@ def generate_script(topic):
     raise RuntimeError("All script providers failed")
 
 def _save_img(content, n):
-    if len(content) < 3000:
-        raise ValueError(f"Too small: {len(content)} bytes")
+    # FIX 1: Raised minimum size threshold — SDXL images are always well above 10KB
+    if len(content) < 10000:
+        raise ValueError(f"Response too small to be a valid image: {len(content)} bytes")
     path = OUTPUT_DIR / f"scene_{n:02d}.jpg"
     path.write_bytes(content)
     return str(path)
 
-def _hf_image(prompt, n):
-    if not HF_API_KEY: raise ValueError("No HF_API_KEY")
-    r = requests.post(
-        "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
-        headers={"Authorization": f"Bearer {HF_API_KEY}"},
-        json={"inputs": prompt[:400]},
-        timeout=120
-    )
-    r.raise_for_status()
-    return _save_img(r.content, n)
-
-def _placeholder(n):
-    colors = ["#1a1a2e","#16213e","#0f3460","#533483","#2b2d42","#8d99ae","#e94560","#ef233c"]
-    path = OUTPUT_DIR / f"scene_{n:02d}.jpg"
-    subprocess.run(["ffmpeg", "-y", "-f", "lavfi",
-                    "-i", f"color={colors[n%8]}:size=1280x720:duration=1",
-                    "-vframes", "1", str(path)], capture_output=True, check=True)
-    return str(path)
+def _hf_image(prompt, n, retries=3):
+    # FIX 2: Added retry loop with backoff so transient HF failures don't fall through to placeholder
+    if not HF_API_KEY:
+        raise ValueError("No HF_API_KEY — check your GitHub Actions secret")
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"   🔄 HuggingFace attempt {attempt}/{retries}...")
+            r = requests.post(
+                "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
+                headers={"Authorization": f"Bearer {HF_API_KEY}"},
+                json={"inputs": prompt[:400]},
+                timeout=120
+            )
+            r.raise_for_status()
+            # FIX 3: Check Content-Type so we never save an error JSON as an image
+            ct = r.headers.get("Content-Type", "")
+            if "image" not in ct:
+                raise ValueError(f"HF returned non-image Content-Type: {ct} — body: {r.text[:200]}")
+            return _save_img(r.content, n)
+        except Exception as e:
+            print(f"   ⚠️  Attempt {attempt} failed: {e}")
+            if attempt < retries:
+                wait = 10 * attempt   # 10s, 20s back-off
+                print(f"   ⏳ Waiting {wait}s before retry...")
+                time.sleep(wait)
+    raise RuntimeError(f"HuggingFace failed after {retries} attempts for scene {n}")
 
 def generate_images(script):
+    # FIX 4: Removed silent placeholder fallback — pipeline now raises if HF fails
+    # so you know immediately instead of getting a blue-screen video
+    if not HF_API_KEY:
+        raise RuntimeError(
+            "HF_API_KEY is not set! Add it to your GitHub Actions secrets as HF_API_KEY."
+        )
     image_paths = []
     for scene in script["scenes"]:
         n, prompt = scene["scene_no"], scene["image_prompt"]
         print(f"\n🎨 Image Scene {n}/8...")
-        path = None
-        try:
-            path = _hf_image(prompt, n)
-            print(f"   ✅ HuggingFace SDXL")
-        except Exception as e:
-            print(f"   ❌ HuggingFace: {e}")
-        if not path:
-            path = _placeholder(n)
-            print(f"   ⚠️  Placeholder scene {n}")
+        path = _hf_image(prompt, n)
+        print(f"   ✅ Saved: {path}")
         image_paths.append(path)
-        time.sleep(2)
+        time.sleep(2)   # polite delay between HF calls
     return image_paths
 
 def generate_voiceover(script):
-    parts = [script.get("hook",""), script["narration_intro"], ""]
+    parts = [script.get("hook", ""), script["narration_intro"], ""]
     for s in script["scenes"]:
         parts.append(s["narration"])
-        if s.get("dialogue","").strip():
+        if s.get("dialogue", "").strip():
             parts.append(f'"{s["dialogue"]}"')
         parts.append("")
-    parts += [script["narration_outro"], f'The moral — {script.get("moral","")}']
-    text = "\n".join(parts)
-    audio = OUTPUT_DIR / "voiceover.mp3"
-    print(f"\n🎙️ Voiceover {len(text)} chars...")
+    parts += [script["narration_outro"], f'The moral — {script.get("moral", "")}']
+    full_text = "\n".join(parts)
+
+    audio_path = OUTPUT_DIR / "voiceover.mp3"
+    print(f"\n🎙️ Voiceover — {len(full_text)} chars...")
+
+    # FIX 5: Correct Edge-TTS --pitch format is "-3Hz", not "-3"
+    # Also removed --pitch entirely (default is fine) to avoid format errors
     r = subprocess.run([
-        "edge-tts", "--voice", "en-US-AriaNeural",
-        "--rate", "+0%",
-        "--text", text,
-        "--write-media", str(audio)
+        "edge-tts",
+        "--voice", "en-US-AriaNeural",
+        "--rate",  "+0%",
+        "--text",  full_text,
+        "--write-media", str(audio_path)
     ], capture_output=True, text=True)
+
     if r.returncode != 0:
-        raise RuntimeError(f"Edge TTS: {r.stderr}")
+        raise RuntimeError(f"Edge TTS failed:\n{r.stderr}")
     print("   ✅ Done")
-    return str(audio)
+    return str(audio_path)
 
 def assemble_video(image_paths, audio_path):
     valid = [p for p in image_paths if p and Path(p).exists()]
-    if not valid: raise ValueError("No images!")
+    if not valid:
+        raise ValueError("No valid images found!")
+
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-        capture_output=True, text=True, check=True)
+        capture_output=True, text=True, check=True
+    )
     total = float(probe.stdout.strip())
-    per_img, fps = total / len(valid), 25
-    frames = int(per_img * fps)
-    print(f"\n📹 {len(valid)} scenes × {per_img:.1f}s = {total:.0f}s...")
+
+    # FIX 6: Removed the +0.5 padding that caused audio/video desync
+    per_img = total / len(valid)
+    fps     = 25
+    frames  = int(per_img * fps)
+
+    print(f"\n📹 {len(valid)} scenes × {per_img:.1f}s = {total:.0f}s total...")
+
     input_args, filters = [], []
     zooms = [
         "z='min(zoom+0.0012,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
         "z='if(lte(zoom,1.0),1.25,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
         "z='min(zoom+0.0010,1.20)':x='0':y='ih/2-(ih/zoom/2)'",
     ]
+
     for i, img in enumerate(valid):
-        input_args += ["-loop", "1", "-t", str(per_img + 0.5), "-i", img]
-        filters.append(f"[{i}:v]scale=1280:720,zoompan={zooms[i%3]}:d={frames}:s=1280x720:fps={fps}[v{i}]")
+        # FIX 6 continued: use exact per_img duration, no +0.5 overshoot
+        input_args += ["-loop", "1", "-t", str(per_img), "-i", img]
+        filters.append(
+            f"[{i}:v]scale=1280:720,"
+            f"zoompan={zooms[i % 3]}:d={frames}:s=1280x720:fps={fps}[v{i}]"
+        )
+
     concat = "".join(f"[v{i}]" for i in range(len(valid)))
     filters.append(f"{concat}concat=n={len(valid)}:v=1:a=0[outv]")
+
     out = OUTPUT_DIR / "final_video.mp4"
-    cmd = (["ffmpeg", "-y"] + input_args + ["-i", audio_path]
-           + ["-filter_complex", ";".join(filters)]
-           + ["-map", "[outv]", "-map", f"{len(valid)}:a"]
-           + ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
-           + ["-c:a", "aac", "-b:a", "192k", "-shortest", str(out)])
+    cmd = (
+        ["ffmpeg", "-y"]
+        + input_args
+        + ["-i", audio_path]
+        + ["-filter_complex", ";".join(filters)]
+        + ["-map", "[outv]", "-map", f"{len(valid)}:a"]
+        + ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
+        + ["-c:a", "aac", "-b:a", "192k", "-shortest", str(out)]
+    )
+
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg: {r.stderr[-500:]}")
-    print(f"   ✅ {out} ({out.stat().st_size//1024//1024}MB)")
+        raise RuntimeError(f"FFmpeg failed:\n{r.stderr[-800:]}")
+
+    size_mb = out.stat().st_size // 1024 // 1024
+    print(f"   ✅ {out} ({size_mb} MB)")
     return str(out)
 
 def generate_metadata(script):
-    prompt = (f'YouTube metadata for: "{script["title"]}"\n'
-              f'Summary: {script["narration_intro"][:200]}\n'
-              f'Return ONLY JSON: {{"youtube_title":"title emojis max 70 chars",'
-              f'"description":"3 para English","tags":["wealth stories","rags to riches",'
-              f'"indian success story","motivational","financial freedom","struggle to success",'
-              f'"inspirational","money story","success motivation","emotional story"]}}')
+    prompt = (
+        f'YouTube metadata for: "{script["title"]}"\n'
+        f'Summary: {script["narration_intro"][:200]}\n'
+        f'Return ONLY JSON: {{"youtube_title":"title emojis max 70 chars",'
+        f'"description":"3 para English","tags":["wealth stories","rags to riches",'
+        f'"indian success story","motivational","financial freedom","struggle to success",'
+        f'"inspirational","money story","success motivation","emotional story"]}}'
+    )
+
     def _g():
+        if not GEMINI_API_KEY: raise ValueError("No GEMINI_API_KEY")
         from google import genai
         c = genai.Client(api_key=GEMINI_API_KEY)
         return _parse_json(c.models.generate_content(model="gemini-2.5-flash", contents=prompt).text)
+
     def _groq():
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+        if not GROQ_API_KEY: raise ValueError("No GROQ_API_KEY")
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "user", "content": prompt}], "max_tokens": 600}, timeout=30)
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 600},
+            timeout=30
+        )
         r.raise_for_status()
         return _parse_json(r.json()["choices"][0]["message"]["content"])
+
     def _cb():
-        r = requests.post("https://api.cerebras.ai/v1/chat/completions",
+        if not CEREBRAS_API_KEY: raise ValueError("No CEREBRAS_API_KEY")
+        r = requests.post(
+            "https://api.cerebras.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
             json={"model": "llama-3.3-70b",
-                  "messages": [{"role": "user", "content": prompt}], "max_tokens": 600}, timeout=30)
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 600},
+            timeout=30
+        )
         r.raise_for_status()
         return _parse_json(r.json()["choices"][0]["message"]["content"])
+
+    # FIX 7: Restored clean except blocks — removed the corrupted edge-tts code
+    # and defined a proper fallback so there's no NameError crash
     for name, fn in [("Gemini", _g), ("Groq", _groq), ("Cerebras", _cb)]:
         try:
             print(f"\n📋 Metadata → {name}...")
@@ -260,15 +315,27 @@ def generate_metadata(script):
             print("   ✅ Done")
             return result
         except Exception as e:
-           result = subprocess.run([
-    "edge-tts",
-    "--voice", "en-US-AriaNeural",
-    "--rate",  "+0%",
-    "--pitch", "-3",  # Changed from "-3Hz" to "-3"
-    "--text",  full_text,
-    "--write-media", str(audio_path)
-], capture_output=True, text=True)
-        json.dump(fallback, f)
+            print(f"   ❌ {name}: {e}")
+            time.sleep(2)
+
+    # FIX 7 continued: fallback now properly defined, not a NameError
+    print("   ⚠️  All metadata providers failed — using basic fallback")
+    fallback = {
+        "youtube_title": f"💰 {script['title']} | Wealth Stories",
+        "description": (
+            f"{script.get('hook', '')}\n\n"
+            f"{script['narration_intro']}\n\n"
+            f"Moral: {script.get('moral', '')}\n\n"
+            "#WealthStories #RagsToRiches #MotivationalStory"
+        ),
+        "tags": [
+            "wealth stories", "rags to riches", "indian success story",
+            "motivational", "financial freedom", "struggle to success",
+            "inspirational", "money story", "success motivation", "emotional story"
+        ]
+    }
+    with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(fallback, f, ensure_ascii=False, indent=2)
     return fallback
 
 def run_pipeline(topic):
@@ -278,7 +345,14 @@ def run_pipeline(topic):
     audio    = generate_voiceover(script)
     video    = assemble_video(images, audio)
     metadata = generate_metadata(script)
-    print(f"\n{'═'*50}\n  ✅ DONE!\n  By: {script.get('_provider')}\n  Title: {metadata.get('youtube_title')}\n{'═'*50}")
+    print(
+        f"\n{'═'*50}\n"
+        f"  ✅ DONE!\n"
+        f"  Provider : {script.get('_provider')}\n"
+        f"  Title    : {metadata.get('youtube_title')}\n"
+        f"  Video    : {video}\n"
+        f"{'═'*50}"
+    )
 
 if __name__ == "__main__":
     import sys
