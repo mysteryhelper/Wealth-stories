@@ -11,14 +11,15 @@ from pathlib import Path
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ─── API KEYS ─────────────────────────────────────────────────────────────────
+# ─── API KEYS ──────────────────────────────────────────────────────────────
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+HF_TOKEN         = os.environ.get("HF_TOKEN", "")
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # SCRIPT PROMPT — Wealth Stories Style
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 
 # ─── CHARACTER BIBLE — Same character across all scenes ──────────────────────
@@ -59,7 +60,7 @@ IMPORTANT: Return ONLY valid JSON. No markdown. No backticks. No explanation.
       "scene_no": 1,
       "narration": "Scene narration in English (3-4 sentences, emotional)",
       "dialogue": "Character dialogue in English (optional, empty string if none)",
-      "image_prompt": "Cinematic Pixar 3D style, [CHARACTER from bible above EXACT description], [background — village hut/city/office], [lighting — warm golden/dramatic/sunrise], [mood — hopeful/sad/triumphant], [camera angle — close-up/wide shot], 16:9, highly detailed"
+      "image_prompt": "Cinematic Pixar 3D style, [CHARACTER from bible above EXACT description], [background — village hut/city/office], [lighting — warm golden/dramatic/sunrise], [mood — hopeful/intense/joyful]"
     }}
   ],
   "narration_outro": "Closing motivational line with life lesson",
@@ -75,9 +76,9 @@ SCENE REQUIREMENTS:
 - EVERY image_prompt MUST start with the exact character description from bible
 '''
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def _parse_json(raw: str) -> dict:
     raw = raw.strip()
@@ -139,9 +140,9 @@ def _try_cerebras(topic: str) -> dict:
     return _parse_json(r.json()["choices"][0]["message"]["content"])
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # STEP 1: SCRIPT — Fallback chain
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def generate_script(topic: str) -> dict:
     providers = [
@@ -168,10 +169,29 @@ def generate_script(topic: str) -> dict:
     raise RuntimeError(f"All script providers failed: {last_err}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 2: IMAGES — Pollinations fallback chain
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 2: IMAGES — Free alternatives with Hugging Face as primary
 # Style: Cinematic Pixar — matches thumbnail style
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+
+def _huggingface_inference(prompt: str, n: int) -> str:
+    """Generate image using Hugging Face Inference API (free tier with HF_TOKEN)"""
+    if not HF_TOKEN:
+        raise ValueError("No HF_TOKEN environment variable")
+    
+    from huggingface_hub import InferenceClient
+    client = InferenceClient(token=HF_TOKEN)
+    
+    # Use Stable Diffusion 3.5 Large Turbo for quality cinematic images
+    styled = f"{prompt}, cinematic, high quality, detailed, professional lighting"
+    image = client.text_to_image(
+        styled, 
+        model="stabilityai/stable-diffusion-3.5-large-turbo"
+    )
+    path = OUTPUT_DIR / f"scene_{n:02d}.jpg"
+    image.save(str(path))
+    return str(path)
+
 
 def _pollinations_default(prompt: str, n: int) -> str:
     import urllib.parse
@@ -212,9 +232,10 @@ def _placeholder(prompt: str, n: int) -> str:
 def generate_images(script: dict) -> list:
     image_paths = []
     providers = [
-        ("Pollinations Default", _pollinations_default),
-        ("Pollinations Flux",    _pollinations_flux),
-        ("Placeholder",          _placeholder),
+        ("Hugging Face (Free)", _huggingface_inference),     # Try free Hugging Face first
+        ("Placeholder",        _placeholder),                # Fast fallback (no API)
+        ("Pollinations Default", _pollinations_default),     # Paid service
+        ("Pollinations Flux",    _pollinations_flux),        # Paid service (higher quality)
     ]
     for scene in script["scenes"]:
         n = scene["scene_no"]
@@ -234,10 +255,10 @@ def generate_images(script: dict) -> list:
     return image_paths
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════��═════════════════════════════════════════════
 # STEP 3: VOICEOVER — Edge TTS English
 # Voice: en-US-AriaNeural (warm, emotional female — perfect for storytelling)
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def generate_voiceover(script: dict) -> str:
     # Assemble full narration
@@ -264,7 +285,7 @@ def generate_voiceover(script: dict) -> str:
         "edge-tts",
         "--voice", "en-US-AriaNeural",
         "--rate",  "+0%",
-        "--pitch", "-3Hz",
+        "--pitch", "-3",
         "--text",  full_text,
         "--write-media", str(audio_path)
     ], capture_output=True, text=True)
@@ -276,9 +297,9 @@ def generate_voiceover(script: dict) -> str:
     return str(audio_path)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # STEP 4: VIDEO ASSEMBLY — FFmpeg Ken Burns
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def assemble_video(image_paths: list, audio_path: str) -> str:
     valid = [p for p in image_paths if p and Path(p).exists()]
@@ -335,9 +356,9 @@ def assemble_video(image_paths: list, audio_path: str) -> str:
     return str(out)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # STEP 5: METADATA
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 META_PROMPT = """
 Write YouTube metadata for a video titled: "{title}"
@@ -349,7 +370,7 @@ Return ONLY valid JSON, no markdown:
 {{
   "youtube_title": "Emotional title with 1-2 emojis, max 70 chars, English",
   "description": "3 paragraphs English description. Para 1: story hook. Para 2: what viewer will learn. Para 3: call to action + moral",
-  "tags": ["wealth stories", "rags to riches", "indian success story", "motivational story", "financial freedom", "struggle to success", "inspirational", "money story", "hindi kahani english", "success motivation"],
+  "tags": ["wealth stories", "rags to riches", "indian success story", "motivational story", "financial freedom", "struggle to success", "inspirational", "money story", "hindi kahani english", "stock market"],
   "category": "Education"
 }}
 """
@@ -411,9 +432,9 @@ def generate_metadata(script: dict) -> dict:
     return fallback
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # MAIN
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(topic: str):
     print(f"\n{'═'*55}")
