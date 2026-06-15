@@ -260,11 +260,14 @@ def generate_metadata(script):
             print("   ✅ Done")
             return result
         except Exception as e:
-            print(f"   ❌ {name}: {e}")
-    fallback = {"youtube_title": f"⭐ {script['title']}",
-                "description": script["narration_intro"],
-                "tags": ["wealth stories", "rags to riches", "indian success story"]}
-    with open(OUTPUT_DIR / "metadata.json", "w") as f:
+           result = subprocess.run([
+    "edge-tts",
+    "--voice", "en-US-AriaNeural",
+    "--rate",  "+0%",
+    "--pitch", "-3",  # Changed from "-3Hz" to "-3"
+    "--text",  full_text,
+    "--write-media", str(audio_path)
+], capture_output=True, text=True)
         json.dump(fallback, f)
     return fallback
 
