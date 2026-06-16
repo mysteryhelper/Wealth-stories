@@ -4,26 +4,24 @@ Channel: @WealthStoriesWS
 
 IMAGE PROVIDERS (tried in order):
   1. Gemini 2.5 Flash Image  — FREE, rotates across multiple Gmail API keys
-  2. ByteDance Seedream 3.0  — FREE via HuggingFace (existing HF_API_KEY)
-  3. Cloudflare Workers AI   — FREE 10k/day, forever free (CF_API_TOKEN + CF_ACCOUNT_ID)
+  2. Cloudflare Workers AI   — FREE 10k/day, FLUX model (CF_API_TOKEN + CF_ACCOUNT_ID)
+  3. ByteDance Seedream 3.0  — via HuggingFace (may be blocked on some runners)
 
-SCRIPT PROVIDERS (tried in order):
-  Gemini 2.5 Flash → Groq Llama 3.3 → Cerebras Llama 3.3
-
+SCRIPT PROVIDERS: Gemini 2.5 Flash → Groq → Cerebras
 VOICE: Edge TTS en-US-AriaNeural
 
-GITHUB ACTIONS SECRETS NEEDED:
-  GEMINI_API_KEY_1   ← your 1st Gmail's AI Studio key  (required)
-  GEMINI_API_KEY_2   ← your 2nd Gmail's AI Studio key  (optional, more quota)
-  GEMINI_API_KEY_3   ← your 3rd Gmail's AI Studio key  (optional, more quota)
-  HF_API_KEY         ← HuggingFace token                (you already have this)
-  GROQ_API_KEY       ← Groq key                         (you already have this)
-  CEREBRAS_API_KEY   ← Cerebras key                     (you already have this)
-  CF_API_TOKEN       ← Cloudflare API token              (just created)
-  CF_ACCOUNT_ID      ← Cloudflare Account ID             (from CF dashboard)
+GITHUB ACTIONS SECRETS:
+  GEMINI_API_KEY    ← Google AI Studio key (required)
+  GEMINI_API_KEY_1  ← 2nd Gmail key (optional)
+  GEMINI_API_KEY_2  ← 3rd Gmail key (optional)
+  GROQ_API_KEY      ← Groq (required for script fallback)
+  CEREBRAS_API_KEY  ← Cerebras (script fallback)
+  HF_API_KEY        ← HuggingFace (image fallback, may be blocked)
+  CF_API_TOKEN      ← Cloudflare API token (image fallback)
+  CF_ACCOUNT_ID     ← Cloudflare Account ID (image fallback)
 """
 
-import os, json, time, requests, subprocess, base64, urllib.parse
+import os, json, time, requests, subprocess, base64
 from pathlib import Path
 
 OUTPUT_DIR = Path("output")
@@ -31,17 +29,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ── API keys ──────────────────────────────────────────────────────────────────
 
-# Collect all Gemini keys from multiple Gmail accounts — skips empty ones
-GEMINI_KEYS = [k for k in [
-    os.environ.get("GEMINI_API_KEY_1", ""),
-    os.environ.get("GEMINI_API_KEY_2", ""),
-    os.environ.get("GEMINI_API_KEY_3", ""),
-] if k.strip()]
-
-# Single key fallback (if someone still uses old GEMINI_API_KEY secret)
-_single = os.environ.get("GEMINI_API_KEY", "")
-if _single.strip() and _single not in GEMINI_KEYS:
-    GEMINI_KEYS.insert(0, _single.strip())
+GEMINI_KEYS = []
+for env_name in ["GEMINI_API_KEY", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2"]:
+    k = os.environ.get(env_name, "").strip()
+    if k and k not in GEMINI_KEYS:
+        GEMINI_KEYS.append(k)
 
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
@@ -49,7 +41,7 @@ HF_API_KEY       = os.environ.get("HF_API_KEY", "")
 CF_API_TOKEN     = os.environ.get("CF_API_TOKEN", "")
 CF_ACCOUNT_ID    = os.environ.get("CF_ACCOUNT_ID", "")
 
-# ── character descriptions ────────────────────────────────────────────────────
+# ── characters ────────────────────────────────────────────────────────────────
 
 CHAR = {
     1: "Arjun 22yo Indian male dark wavy hair torn beige kurta barefoot poor village",
@@ -157,64 +149,47 @@ def _cerebras_script(topic):
     return _parse_json(r.json()["choices"][0]["message"]["content"])
 
 def generate_script(topic):
-    # Try each Gemini key first
     for i, key in enumerate(GEMINI_KEYS):
         try:
-            print(f"\n📝 Script → Gemini key #{i+1}...")
+            print(f"\n  Script -> Gemini key #{i+1}...")
             result = _gemini_script(topic, key)
             assert "scenes" in result and len(result["scenes"]) >= 6
             result["_provider"] = f"Gemini key #{i+1}"
-            print(f"   ✅ Done")
+            print(f"   OK")
             with open(OUTPUT_DIR / "script.json", "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             return result
         except Exception as e:
-            print(f"   ❌ Gemini key #{i+1}: {e}")
+            print(f"   FAIL Gemini key #{i+1}: {e}")
             time.sleep(2)
 
-    # Fallback to Groq
-    try:
-        print(f"\n📝 Script → Groq Llama 3.3...")
-        result = _groq_script(topic)
-        assert "scenes" in result and len(result["scenes"]) >= 6
-        result["_provider"] = "Groq"
-        print(f"   ✅ Done")
-        with open(OUTPUT_DIR / "script.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        return result
-    except Exception as e:
-        print(f"   ❌ Groq: {e}")
-        time.sleep(2)
+    for name, fn in [("Groq", lambda: _groq_script(topic)),
+                     ("Cerebras", lambda: _cerebras_script(topic))]:
+        try:
+            print(f"\n  Script -> {name}...")
+            result = fn()
+            assert "scenes" in result and len(result["scenes"]) >= 6
+            result["_provider"] = name
+            print(f"   OK")
+            with open(OUTPUT_DIR / "script.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            return result
+        except Exception as e:
+            print(f"   FAIL {name}: {e}")
+            time.sleep(2)
 
-    # Fallback to Cerebras
-    try:
-        print(f"\n📝 Script → Cerebras Llama 3.3...")
-        result = _cerebras_script(topic)
-        assert "scenes" in result and len(result["scenes"]) >= 6
-        result["_provider"] = "Cerebras"
-        print(f"   ✅ Done")
-        with open(OUTPUT_DIR / "script.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        return result
-    except Exception as e:
-        print(f"   ❌ Cerebras: {e}")
+    raise RuntimeError("ALL script providers failed")
 
-    raise RuntimeError("ALL script providers failed — check your API keys")
-
-# ── image generation ──────────────────────────────────────────────────────────
+# ── image providers ───────────────────────────────────────────────────────────
 
 def _gemini_image(prompt, n, api_key, retries=2):
-    """
-    Gemini 2.5 Flash Image — FREE 500 images/day per Gmail account
-    Rotates across multiple Gmail API keys to multiply quota
-    """
+    """PRIMARY — Gemini 2.5 Flash Image. FREE 500/day per Gmail key."""
     from google import genai
     from google.genai import types
-
     client = genai.Client(api_key=api_key)
     for attempt in range(1, retries + 1):
         try:
-            print(f"   ✨ Gemini Image attempt {attempt}/{retries}...")
+            print(f"   Gemini Image attempt {attempt}/{retries}...")
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-image-generation",
                 contents=prompt,
@@ -228,25 +203,60 @@ def _gemini_image(prompt, n, api_key, retries=2):
                     if isinstance(img_bytes, str):
                         img_bytes = base64.b64decode(img_bytes)
                     return _save_img(img_bytes, n)
-            raise ValueError("No image part in Gemini response")
+            raise ValueError("No image part found in Gemini response")
         except Exception as e:
-            print(f"   ⚠️  Attempt {attempt} failed: {e}")
+            print(f"   Gemini attempt {attempt} failed: {e}")
             if attempt < retries:
                 time.sleep(8 * attempt)
-    raise RuntimeError(f"Gemini Image failed after {retries} attempts")
+    raise RuntimeError("Gemini Image failed")
 
 
-def _seedream_image(prompt, n, retries=2):
+def _cloudflare_image(prompt, n, retries=3):
     """
-    ByteDance Seedream 3.0 via HuggingFace — FREE
-    Uses your existing HF_API_KEY — much better quality than old SDXL
+    FALLBACK 1 — Cloudflare Workers AI FLUX.1 Schnell
+    FREE forever, 10k neurons/day, no DNS issues on GitHub Actions
+    api.cloudflare.com is always accessible from GitHub Actions runners
+    """
+    if not CF_API_TOKEN or not CF_ACCOUNT_ID:
+        raise ValueError("CF_API_TOKEN or CF_ACCOUNT_ID not set")
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    )
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"   Cloudflare FLUX attempt {attempt}/{retries}...")
+            r = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {CF_API_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"prompt": prompt[:500], "num_steps": 8},
+                timeout=90
+            )
+            r.raise_for_status()
+            data = r.json()
+            img_b64 = data.get("result", {}).get("image")
+            if not img_b64:
+                raise ValueError(f"No image in CF response: {str(data)[:300]}")
+            return _save_img(base64.b64decode(img_b64), n)
+        except Exception as e:
+            print(f"   Cloudflare attempt {attempt} failed: {e}")
+            if attempt < retries:
+                time.sleep(10 * attempt)
+    raise RuntimeError("Cloudflare FLUX failed")
+
+
+def _huggingface_image(prompt, n, retries=2):
+    """
+    FALLBACK 2 — HuggingFace Seedream 3.0
+    NOTE: May fail with DNS error on GitHub Actions Azure runners
+    Kept as last resort in case runner has access
     """
     if not HF_API_KEY:
         raise ValueError("No HF_API_KEY")
-
     for attempt in range(1, retries + 1):
         try:
-            print(f"   🌸 Seedream 3.0 attempt {attempt}/{retries}...")
+            print(f"   HuggingFace attempt {attempt}/{retries}...")
             r = requests.post(
                 "https://api-inference.huggingface.co/models/ByteDance-Seed/Seedream-3.0",
                 headers={"Authorization": f"Bearer {HF_API_KEY}"},
@@ -259,117 +269,84 @@ def _seedream_image(prompt, n, retries=2):
                 raise ValueError(f"Non-image response: {ct} — {r.text[:200]}")
             return _save_img(r.content, n)
         except Exception as e:
-            print(f"   ⚠️  Attempt {attempt} failed: {e}")
+            print(f"   HuggingFace attempt {attempt} failed: {e}")
             if attempt < retries:
                 time.sleep(15 * attempt)
-    raise RuntimeError(f"Seedream failed after {retries} attempts")
-
-
-def _cloudflare_image(prompt, n, retries=2):
-    """
-    Cloudflare Workers AI — FLUX.1 Schnell — 100% FREE forever
-    10,000 neurons/day free — 8 scenes uses less than 0.1% of limit
-    No credit card ever charged on free plan
-    """
-    if not CF_API_TOKEN or not CF_ACCOUNT_ID:
-        raise ValueError("No CF_API_TOKEN or CF_ACCOUNT_ID")
-
-    url = (
-        f"https://api.cloudflare.com/client/v4/accounts/"
-        f"{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    )
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"   ☁️  Cloudflare FLUX attempt {attempt}/{retries}...")
-            r = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {CF_API_TOKEN}",
-                         "Content-Type": "application/json"},
-                json={"prompt": prompt[:500], "num_steps": 8},
-                timeout=60
-            )
-            r.raise_for_status()
-            data = r.json()
-            img_b64 = data.get("result", {}).get("image")
-            if not img_b64:
-                raise ValueError(f"No image in CF response: {str(data)[:200]}")
-            return _save_img(base64.b64decode(img_b64), n)
-        except Exception as e:
-            print(f"   ⚠️  Attempt {attempt} failed: {e}")
-            if attempt < retries:
-                time.sleep(8 * attempt)
-    raise RuntimeError(f"Cloudflare FLUX failed after {retries} attempts")
+    raise RuntimeError("HuggingFace failed")
 
 
 def generate_images(script):
     """
-    For each scene, tries providers in this order:
-      1. Gemini 2.5 Flash Image (rotates across all Gmail keys)
-      2. ByteDance Seedream 3.0 via HuggingFace
-      3. Cloudflare Workers AI FLUX (forever free)
-    Hard fails with clear error if ALL providers fail — no blue screens ever.
+    Provider order (optimized for GitHub Actions):
+      1. Gemini Image     — primary, best quality
+      2. Cloudflare FLUX  — reliable fallback, no DNS issues
+      3. HuggingFace      — last resort, may have DNS issues
+
+    NO placeholder fallback — fails loudly if all providers fail.
     """
-    if not GEMINI_KEYS and not HF_API_KEY and not (CF_API_TOKEN and CF_ACCOUNT_ID):
+    print(f"\n  Image providers available:")
+    print(f"   Gemini keys : {len(GEMINI_KEYS)}")
+    print(f"   Cloudflare  : {'YES' if CF_API_TOKEN and CF_ACCOUNT_ID else 'NO - add CF_API_TOKEN + CF_ACCOUNT_ID'}")
+    print(f"   HuggingFace : {'YES' if HF_API_KEY else 'NO'}")
+
+    if not GEMINI_KEYS and not (CF_API_TOKEN and CF_ACCOUNT_ID) and not HF_API_KEY:
         raise RuntimeError(
-            "No image providers configured!\n"
-            "Add at least one of: GEMINI_API_KEY_1, HF_API_KEY, "
-            "or CF_API_TOKEN+CF_ACCOUNT_ID to GitHub secrets"
+            "NO image providers configured!\n"
+            "Add GEMINI_API_KEY and/or CF_API_TOKEN+CF_ACCOUNT_ID to GitHub Secrets"
         )
 
     image_paths = []
 
     for scene in script["scenes"]:
-        n       = scene["scene_no"]
-        prompt  = scene["image_prompt"]
-        print(f"\n🎨 Scene {n}/8 — generating image...")
+        n      = scene["scene_no"]
+        prompt = scene["image_prompt"]
+        print(f"\n  Image scene {n}/8...")
         path = None
 
-        # ── 1. Gemini: rotate keys per scene to spread quota ─────────────────
+        # 1. Gemini Image (rotate keys across scenes)
         if GEMINI_KEYS:
-            key_index = (n - 1) % len(GEMINI_KEYS)
-            key       = GEMINI_KEYS[key_index]
+            key_idx = (n - 1) % len(GEMINI_KEYS)
+            key     = GEMINI_KEYS[key_idx]
             try:
                 path = _gemini_image(prompt, n, key)
-                print(f"   ✅ Gemini key #{key_index+1} → {path}")
+                print(f"   OK Gemini key #{key_idx+1} -> {path}")
             except Exception as e:
-                print(f"   ❌ Gemini failed: {e}")
-                # If first key failed, try remaining keys
+                print(f"   FAIL Gemini: {e}")
+                # Try other Gemini keys
                 for alt_i, alt_key in enumerate(GEMINI_KEYS):
-                    if alt_i == key_index:
+                    if alt_i == key_idx:
                         continue
                     try:
-                        print(f"   🔁 Trying Gemini key #{alt_i+1}...")
                         path = _gemini_image(prompt, n, alt_key)
-                        print(f"   ✅ Gemini key #{alt_i+1} → {path}")
+                        print(f"   OK Gemini key #{alt_i+1} (retry) -> {path}")
                         break
                     except Exception as e2:
-                        print(f"   ❌ Gemini key #{alt_i+1} failed: {e2}")
+                        print(f"   FAIL Gemini key #{alt_i+1}: {e2}")
 
-        # ── 2. Seedream 3.0 via HuggingFace ──────────────────────────────────
-        if not path and HF_API_KEY:
-            try:
-                path = _seedream_image(prompt, n)
-                print(f"   ✅ Seedream 3.0 → {path}")
-            except Exception as e:
-                print(f"   ❌ Seedream failed: {e}")
-
-        # ── 3. Cloudflare Workers AI FLUX ────────────────────────────────────
+        # 2. Cloudflare FLUX (reliable on GitHub Actions — no DNS issues)
         if not path and CF_API_TOKEN and CF_ACCOUNT_ID:
             try:
                 path = _cloudflare_image(prompt, n)
-                print(f"   ✅ Cloudflare FLUX → {path}")
+                print(f"   OK Cloudflare -> {path}")
             except Exception as e:
-                print(f"   ❌ Cloudflare failed: {e}")
+                print(f"   FAIL Cloudflare: {e}")
 
-        # ── Hard stop — no silent blue placeholder ────────────────────────────
+        # 3. HuggingFace (last resort — may have DNS issues on Azure runners)
+        if not path and HF_API_KEY:
+            try:
+                path = _huggingface_image(prompt, n)
+                print(f"   OK HuggingFace -> {path}")
+            except Exception as e:
+                print(f"   FAIL HuggingFace: {e}")
+
+        # Hard stop — no silent color placeholder ever
         if not path:
             raise RuntimeError(
-                f"\n💥 Scene {n}: ALL image providers failed!\n"
-                f"   • Gemini keys tried: {len(GEMINI_KEYS)}\n"
-                f"   • HF_API_KEY set: {bool(HF_API_KEY)}\n"
-                f"   • CF keys set: {bool(CF_API_TOKEN and CF_ACCOUNT_ID)}\n"
-                f"   Check your GitHub Actions secrets and try again."
+                f"\n  FATAL: Scene {n} — all image providers failed!\n"
+                f"  Gemini keys: {len(GEMINI_KEYS)}\n"
+                f"  Cloudflare set: {bool(CF_API_TOKEN and CF_ACCOUNT_ID)}\n"
+                f"  HuggingFace set: {bool(HF_API_KEY)}\n"
+                f"  Check GitHub Secrets and re-run."
             )
 
         image_paths.append(path)
@@ -386,23 +363,21 @@ def generate_voiceover(script):
         if s.get("dialogue", "").strip():
             parts.append(f'"{s["dialogue"]}"')
         parts.append("")
-    parts += [script["narration_outro"], f'The moral — {script.get("moral", "")}']
+    parts += [script["narration_outro"], f'The moral: {script.get("moral", "")}']
     full_text = "\n".join(parts)
 
     audio_path = OUTPUT_DIR / "voiceover.mp3"
-    print(f"\n🎙️ Voiceover — {len(full_text)} chars...")
+    print(f"\n  Voiceover — {len(full_text)} chars...")
 
     r = subprocess.run([
-        "edge-tts",
-        "--voice", "en-US-AriaNeural",
-        "--rate",  "+0%",
-        "--text",  full_text,
+        "edge-tts", "--voice", "en-US-AriaNeural",
+        "--rate", "+0%", "--text", full_text,
         "--write-media", str(audio_path)
     ], capture_output=True, text=True)
 
     if r.returncode != 0:
-        raise RuntimeError(f"Edge TTS failed:\n{r.stderr}")
-    print("   ✅ Done")
+        raise RuntimeError(f"Edge TTS failed: {r.stderr}")
+    print("   OK")
     return str(audio_path)
 
 # ── video assembly ────────────────────────────────────────────────────────────
@@ -410,7 +385,7 @@ def generate_voiceover(script):
 def assemble_video(image_paths, audio_path):
     valid = [p for p in image_paths if p and Path(p).exists()]
     if not valid:
-        raise ValueError("No valid images found!")
+        raise ValueError("No valid images!")
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -422,7 +397,7 @@ def assemble_video(image_paths, audio_path):
     fps     = 25
     frames  = int(per_img * fps)
 
-    print(f"\n📹 {len(valid)} scenes × {per_img:.1f}s = {total:.0f}s total...")
+    print(f"\n  Video: {len(valid)} scenes x {per_img:.1f}s = {total:.0f}s total")
 
     input_args, filters = [], []
     zooms = [
@@ -430,12 +405,11 @@ def assemble_video(image_paths, audio_path):
         "z='if(lte(zoom,1.0),1.25,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
         "z='min(zoom+0.0010,1.20)':x='0':y='ih/2-(ih/zoom/2)'",
     ]
-
     for i, img in enumerate(valid):
         input_args += ["-loop", "1", "-t", str(per_img), "-i", img]
         filters.append(
             f"[{i}:v]scale=1280:720,"
-            f"zoompan={zooms[i % 3]}:d={frames}:s=1280x720:fps={fps}[v{i}]"
+            f"zoompan={zooms[i%3]}:d={frames}:s=1280x720:fps={fps}[v{i}]"
         )
 
     concat = "".join(f"[v{i}]" for i in range(len(valid)))
@@ -443,21 +417,18 @@ def assemble_video(image_paths, audio_path):
 
     out = OUTPUT_DIR / "final_video.mp4"
     cmd = (
-        ["ffmpeg", "-y"]
-        + input_args
-        + ["-i", audio_path]
+        ["ffmpeg", "-y"] + input_args + ["-i", audio_path]
         + ["-filter_complex", ";".join(filters)]
         + ["-map", "[outv]", "-map", f"{len(valid)}:a"]
         + ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
         + ["-c:a", "aac", "-b:a", "192k", "-shortest", str(out)]
     )
-
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed:\n{r.stderr[-800:]}")
+        raise RuntimeError(f"FFmpeg failed: {r.stderr[-800:]}")
 
     size_mb = out.stat().st_size // 1024 // 1024
-    print(f"   ✅ {out} ({size_mb} MB)")
+    print(f"   OK {out} ({size_mb} MB)")
     return str(out)
 
 # ── metadata ──────────────────────────────────────────────────────────────────
@@ -466,20 +437,20 @@ def generate_metadata(script):
     prompt = (
         f'YouTube metadata for: "{script["title"]}"\n'
         f'Summary: {script["narration_intro"][:200]}\n'
-        f'Return ONLY JSON: {{"youtube_title":"title emojis max 70 chars",'
-        f'"description":"3 para English","tags":["wealth stories","rags to riches",'
+        f'Return ONLY JSON: {{"youtube_title":"title with emojis max 70 chars",'
+        f'"description":"3 paragraphs English","tags":["wealth stories","rags to riches",'
         f'"indian success story","motivational","financial freedom","struggle to success",'
         f'"inspirational","money story","success motivation","emotional story"]}}'
     )
 
-    def _g(key):
+    def _gemini_meta(key):
         from google import genai
         c = genai.Client(api_key=key)
         return _parse_json(
             c.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
         )
 
-    def _groq():
+    def _groq_meta():
         if not GROQ_API_KEY: raise ValueError("No GROQ_API_KEY")
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -487,60 +458,43 @@ def generate_metadata(script):
                      "Content-Type": "application/json"},
             json={"model": "llama-3.3-70b-versatile",
                   "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 600},
+                  "max_tokens": 800},
             timeout=30
         )
         r.raise_for_status()
         return _parse_json(r.json()["choices"][0]["message"]["content"])
 
-    def _cb():
-        if not CEREBRAS_API_KEY: raise ValueError("No CEREBRAS_API_KEY")
-        r = requests.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 600},
-            timeout=30
-        )
-        r.raise_for_status()
-        return _parse_json(r.json()["choices"][0]["message"]["content"])
-
-    # Try all Gemini keys first
     for i, key in enumerate(GEMINI_KEYS):
         try:
-            print(f"\n📋 Metadata → Gemini key #{i+1}...")
-            result = _g(key)
+            print(f"\n  Metadata -> Gemini key #{i+1}...")
+            result = _gemini_meta(key)
             with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
-            print("   ✅ Done")
+            print("   OK")
             return result
         except Exception as e:
-            print(f"   ❌ Gemini key #{i+1}: {e}")
+            print(f"   FAIL: {e}")
             time.sleep(2)
 
-    for name, fn in [("Groq", _groq), ("Cerebras", _cb)]:
-        try:
-            print(f"\n📋 Metadata → {name}...")
-            result = fn()
-            with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            print("   ✅ Done")
-            return result
-        except Exception as e:
-            print(f"   ❌ {name}: {e}")
-            time.sleep(2)
+    try:
+        print(f"\n  Metadata -> Groq...")
+        result = _groq_meta()
+        with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print("   OK")
+        return result
+    except Exception as e:
+        print(f"   FAIL Groq: {e}")
 
-    # Safe fallback — always works
-    print("   ⚠️  All metadata providers failed — using fallback")
+    # Always-works fallback
+    print("   Using basic fallback metadata")
     fallback = {
         "youtube_title": f"💰 {script['title']} | Wealth Stories",
         "description": (
-            f"{script.get('hook', '')}\n\n"
+            f"{script.get('hook','')}\n\n"
             f"{script['narration_intro']}\n\n"
-            f"Moral: {script.get('moral', '')}\n\n"
-            "#WealthStories #RagsToRiches #MotivationalStory"
+            f"Moral: {script.get('moral','')}\n\n"
+            "#WealthStories #RagsToRiches #MotivationalStory #IndianSuccessStory"
         ),
         "tags": [
             "wealth stories", "rags to riches", "indian success story",
@@ -555,28 +509,26 @@ def generate_metadata(script):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def run_pipeline(topic):
-    print(
-        f"\n{'═'*52}\n"
-        f"  💰 WEALTH STORIES PIPELINE\n"
-        f"  Topic: {topic}\n"
-        f"  Gemini keys loaded: {len(GEMINI_KEYS)}\n"
-        f"  HuggingFace: {'✅' if HF_API_KEY else '❌'}\n"
-        f"  Cloudflare:  {'✅' if CF_API_TOKEN and CF_ACCOUNT_ID else '❌'}\n"
-        f"{'═'*52}"
-    )
+    print(f"\n{'='*52}")
+    print(f"  WEALTH STORIES PIPELINE")
+    print(f"  Topic: {topic}")
+    print(f"  Gemini keys: {len(GEMINI_KEYS)}")
+    print(f"  Cloudflare : {'YES' if CF_API_TOKEN and CF_ACCOUNT_ID else 'NO'}")
+    print(f"  HuggingFace: {'YES' if HF_API_KEY else 'NO'}")
+    print(f"{'='*52}")
+
     script   = generate_script(topic)
     images   = generate_images(script)
     audio    = generate_voiceover(script)
     video    = assemble_video(images, audio)
     metadata = generate_metadata(script)
-    print(
-        f"\n{'═'*52}\n"
-        f"  ✅ PIPELINE COMPLETE!\n"
-        f"  Script by : {script.get('_provider')}\n"
-        f"  Title     : {metadata.get('youtube_title')}\n"
-        f"  Video     : {video}\n"
-        f"{'═'*52}"
-    )
+
+    print(f"\n{'='*52}")
+    print(f"  DONE!")
+    print(f"  Script  : {script.get('_provider')}")
+    print(f"  Title   : {metadata.get('youtube_title')}")
+    print(f"  Video   : {video}")
+    print(f"{'='*52}")
 
 if __name__ == "__main__":
     import sys
