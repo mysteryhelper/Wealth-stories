@@ -1,4 +1,4 @@
-name: Wealth Stories â€” Video Pipeline
+name: Wealth Stories - Video Pipeline
 
 on:
   # Manual trigger with custom topic
@@ -7,7 +7,7 @@ on:
       topic:
         description: 'Story topic (English)'
         required: true
-        default: 'A poor boy from a village who became a millionaire with just â‚¹100'
+        default: 'A poor boy from a village who became a millionaire with just 100 rupees'
         type: string
 
   # Daily 7 AM IST = 1:30 AM UTC
@@ -39,16 +39,29 @@ jobs:
 
       - name: Run Wealth Stories Pipeline
         env:
-          GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          # ── Gemini keys (one per Gmail account — all free) ──────────────────
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}    # old single key (backward compat)
+          GEMINI_API_KEY_1:  ${{ secrets.GEMINI_API_KEY_1 }}  # Gmail account 1
+          GEMINI_API_KEY_2:  ${{ secrets.GEMINI_API_KEY_2 }}  # Gmail account 2
+          GEMINI_API_KEY_3:  ${{ secrets.GEMINI_API_KEY_3 }}  # Gmail account 3
+
+          # ── Other script providers ───────────────────────────────────────────
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY:  ${{ secrets.CEREBRAS_API_KEY }}
+
+          # ── Image fallback providers ─────────────────────────────────────────
+          HF_API_KEY:        ${{ secrets.HF_API_KEY }}        # Seedream 3.0 fallback
+          CF_API_TOKEN:      ${{ secrets.CF_API_TOKEN }}      # Cloudflare FLUX fallback
+          CF_ACCOUNT_ID:     ${{ secrets.CF_ACCOUNT_ID }}     # Cloudflare account ID
+
         run: |
           if [ "${{ github.event_name }}" == "schedule" ]; then
             TOPIC=$(python scripts/random_topic.py)
-            echo "ðŸ“Œ Today's topic: $TOPIC"
+            echo "Today's topic: $TOPIC"
           else
             TOPIC="${{ github.event.inputs.topic }}"
           fi
+          echo "Running pipeline with topic: $TOPIC"
           python scripts/pipeline.py "$TOPIC"
 
       - name: Upload Video + Assets
@@ -64,7 +77,7 @@ jobs:
 
       - name: Job Summary
         run: |
-          echo "## ðŸ’° Wealth Stories â€” Video Ready!" >> $GITHUB_STEP_SUMMARY
+          echo "## Wealth Stories - Video Ready!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f output/metadata.json ]; then
             TITLE=$(python -c "import json; print(json.load(open('output/metadata.json'))['youtube_title'])")
@@ -73,5 +86,5 @@ jobs:
             echo "**Script Provider:** $PROVIDER" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Files:" >> $GITHUB_STEP_SUMMARY
+          echo "### Output Files:" >> $GITHUB_STEP_SUMMARY
           ls -lh output/ >> $GITHUB_STEP_SUMMARY
